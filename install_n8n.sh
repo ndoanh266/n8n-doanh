@@ -286,8 +286,8 @@ EOL
             else
                  echo "Đã thêm vào crontab để chạy mỗi 5 phút."
                  # Nếu bạn thực sự cần ngăn máy tính ngủ, hãy bỏ comment dòng dưới
-                 # echo "Đang chạy caffeine trong nền (nếu đã cài đặt)..."
-                 # sudo nohup caffeine > /dev/null 2>&1 & disown
+                 echo "Đang chạy caffeine trong nền (nếu đã cài đặt)..."
+                 sudo nohup caffeine > /dev/null 2>&1 & disown
             fi
         fi
     fi
