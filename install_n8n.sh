@@ -26,7 +26,9 @@ fi
 echo "==== QUAN TRỌNG: CẤU HÌNH DNS TRÊN CLOUDFLARE ===="
 echo "Hãy đảm bảo bạn đã tạo một bản ghi CNAME trong Cloudflare DNS:"
 echo "  Loại: CNAME"
-echo "  Tên: ${N8N_DOMAIN%%.*}  (Chỉ phần tên miền phụ, ví dụ: 'n8n' nếu tên miền là 'n8n.doanh.id.vn')"
+# Lấy phần subdomain từ N8N_DOMAIN
+SUBDOMAIN=$(echo "$N8N_DOMAIN" | cut -d'.' -f1)
+echo "  Tên: ${SUBDOMAIN}  (Chỉ phần tên miền phụ, ví dụ: 'n8n')"
 echo "  Nội dung (Target): <ID của Tunnel của bạn>.cfargotunnel.com"
 echo "  Proxy status: Proxied (Đám mây màu cam)"
 echo "Bạn có thể tìm ID Tunnel trong trang Cloudflare Zero Trust -> Access -> Tunnels."
@@ -37,7 +39,9 @@ echo "==== BẮT ĐẦU THIẾT LẬP N8N ===="
 # Unmask Docker services
 echo "Đang khởi tạo hệ thống Docker..."
 sudo apt update > /dev/null 2>&1
-sudo apt install -y docker-compose > /dev/null 2>&1 # Đảm bảo docker-compose được cài đặt
+# Đảm bảo các gói cần thiết được cài đặt
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin curl > /dev/null 2>&1 || { echo "Lỗi: Không thể cài đặt các gói Docker cần thiết."; exit 1; }
+
 sudo systemctl unmask docker > /dev/null 2>&1
 sudo systemctl unmask docker.socket > /dev/null 2>&1
 sudo systemctl start docker > /dev/null 2>&1
@@ -68,6 +72,10 @@ echo "Đang tạo file cấu hình Cloudflared (config.yml)..."
 # File này định nghĩa cách tunnel định tuyến lưu lượng truy cập dựa trên hostname
 cat << EOF > "$BASE_DIR/.cloudflared/config.yml"
 # Định tuyến lưu lượng cho tên miền của bạn đến dịch vụ n8n
+# Xem thêm tại: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/configuration/
+tunnel: ${TUNNEL_NAME}
+credentials-file: /etc/cloudflared/${TUNNEL_NAME}.json # Mặc định cloudflared sẽ tìm token trong file này khi dùng command `run <Tên tunnel>`
+
 ingress:
   - hostname: ${N8N_DOMAIN}
     service: http://n8n:5678 # Trỏ đến service n8n trong cùng Docker network
@@ -77,6 +85,7 @@ EOF
 
 # Create docker-compose.yml
 echo "Đang tạo file docker-compose.yml..."
+# Sử dụng docker compose plugin mới (v2) thay vì docker-compose (v1)
 cat << EOF > "$BASE_DIR/docker-compose.yml"
 version: '3.7'
 
@@ -139,15 +148,13 @@ services:
     restart: always
     depends_on:
       - n8n # Đảm bảo n8n đã chạy (nhưng không cần đợi healthy)
-    # --- Lệnh chạy tunnel sử dụng token VÀ config file ---
-    # tunnel: tên tunnel đã tạo trên Cloudflare dashboard
-    # --config: đường dẫn đến file config bên TRONG container
-    # run: chạy tunnel
-    # --token: token để xác thực
-    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run --token ${CF_TOKEN} ${TUNNEL_NAME}
-    volumes:
-      # Mount thư mục chứa config.yml vào vị trí cloudflared tìm kiếm mặc định
-      - ./.cloudflared:/etc/cloudflared
+    # --- Lệnh chạy tunnel sử dụng token ---
+    # Cloudflared sẽ tự động tạo file credentials nếu chưa có và dùng token
+    command: tunnel --no-autoupdate run --token ${CF_TOKEN} ${TUNNEL_NAME}
+    # --- Không cần mount config.yml nếu bạn dùng command 'run --token <TOKEN> <NAME>'
+    #     vì ingress rules sẽ được quản lý qua Cloudflare Dashboard hoặc API
+    # volumes:
+    #   - ./.cloudflared:/etc/cloudflared
     networks:
       - n8n_network # Thêm vào network
 
@@ -175,6 +182,11 @@ sudo docker compose down --remove-orphans > /dev/null 2>&1
 # Khởi chạy các container trong nền
 echo "Đang khởi tạo và chạy các container..."
 sudo docker compose up -d
+if [ $? -ne 0 ]; then
+    echo "Lỗi: docker compose up -d thất bại. Vui lòng kiểm tra log."
+    sudo docker compose logs
+    exit 1
+fi
 
 # Kiểm tra trạng thái container sau một khoảng thời gian chờ
 echo "Đợi các container khởi động (khoảng 30 giây)..."
@@ -184,37 +196,40 @@ echo "==== TRẠNG THÁI CONTAINER ===="
 sudo docker compose ps
 
 # Hiển thị log của cloudflared để kiểm tra kết nối tunnel và định tuyến
-echo "==== LOGS CLOUDFLARED (Kiểm tra kết nối Tunnel và Ingress Rules) ===="
+echo "==== LOGS CLOUDFLARED (Kiểm tra kết nối Tunnel) ===="
 sudo docker compose logs --tail=50 cloudflared # Hiển thị 50 dòng log cuối
 
 # Quay lại thư mục gốc (nếu cần)
 cd ..
 
-echo "==== THIẾT LẬP HOÀN TẤT ===="
+echo "==== THIẾT LẬP N8N HOÀN TẤT ===="
 echo "N8N (nếu mọi thứ thành công) nên có thể truy cập tại: https://${N8N_DOMAIN}"
 echo "Nếu không truy cập được, hãy kiểm tra:"
-echo "  1. Cấu hình CNAME trong Cloudflare DNS đã đúng và được proxy."
-echo "  2. Log của container 'cloudflared' xem có báo lỗi kết nối hoặc định tuyến không (lệnh: sudo docker compose -f $BASE_DIR/docker-compose.yml logs cloudflared)."
-echo "  3. Log của container 'n8n' xem có lỗi khởi động không (lệnh: sudo docker compose -f $BASE_DIR/docker-compose.yml logs n8n)."
+echo "  1. Cấu hình CNAME trong Cloudflare DNS đã đúng và được proxy (đám mây màu cam)."
+echo "  2. Tên Tunnel (${TUNNEL_NAME}) và Token đã nhập chính xác."
+echo "  3. Log của container 'cloudflared' xem có báo lỗi kết nối không (lệnh: sudo docker compose -f $BASE_DIR/docker-compose.yml logs cloudflared)."
+echo "  4. Log của container 'n8n' xem có lỗi khởi động không (lệnh: sudo docker compose -f $BASE_DIR/docker-compose.yml logs n8n)."
 echo ""
 echo "Tài khoản đăng nhập N8N:"
 echo "  Username: admin"
 echo "  Password: changeme123 (!!! HÃY ĐỔI MẬT KHẨU NGAY TRONG CÀI ĐẶT N8N !!!)"
 echo "--------------------------------------------------"
 
-# --- Phần giữ session (giữ nguyên cấu trúc logic) ---
+# --- Phần giữ session (Tùy chọn) ---
 echo "==== SCRIPT TỰ ĐỘNG GIỮ SESSION (Tùy chọn) ===="
+echo "Phần này giúp mô phỏng hoạt động để ngăn một số môi trường Cloud Shell/VNC tự động ngắt kết nối do không hoạt động."
 read -p "Bạn có muốn thiết lập script giữ session không? (y/N): " SETUP_MONITOR
 if [[ "$SETUP_MONITOR" =~ ^[Yy]$ ]]; then
-    read -p "Nhập URL remote để ping (ví dụ: URL của một dịch vụ uptime monitor như Uptime Kuma, Better Uptime,...): " MONITOR_URL
+    # Hỏi URL để ping. URL này nên là một URL ít thay đổi và luôn sẵn sàng.
+    # Có thể là URL VNC, URL trang quản lý của cloud provider, hoặc thậm chí là một dịch vụ uptime monitor.
+    read -p "Nhập URL remote để ping (ví dụ: URL VNC, URL trang quản lý, hoặc URL endpoint của Uptime Kuma/Better Uptime): " MONITOR_URL
 
     if [ -z "$MONITOR_URL" ]; then
         echo "Lỗi: URL không được để trống! Bỏ qua thiết lập giữ session."
     else
-        echo "Đang cài đặt các gói cần thiết (curl, caffeine - nếu có)..."
-        sudo apt update > /dev/null 2>&1
-        sudo apt install -y curl > /dev/null 2>&1 # Đảm bảo curl được cài đặt
-        # Caffeine có thể không cần thiết nếu chỉ dùng cron job
+        echo "Đang cài đặt các gói cần thiết (curl)..."
+        # Đảm bảo curl đã được cài ở trên
+        # Có thể cân nhắc cài caffeine nếu muốn ngăn cả máy tính sleep, nhưng cron job thường đủ để giữ session shell/vnc
         # sudo apt install -y caffeine > /dev/null 2>&1
 
         # Sử dụng thư mục home của user hiện tại
@@ -230,14 +245,23 @@ LOG_FILE="$MONITOR_LOG_PATH"
 # Ghi log thời gian bắt đầu
 echo "\$(date '+%Y-%m-%d %H:%M:%S') - Starting ping to \$URL" >> "\$LOG_FILE"
 
-# Thực hiện curl với timeout và ghi kết quả
-curl_output=\$(curl -s --connect-timeout 15 --max-time 30 "\$URL" 2>&1)
-curl_status=\$?
+# Thực hiện curl với timeout 15 giây kết nối, tối đa 30 giây tổng cộng và ghi kết quả
+# -L: theo dõi chuyển hướng (nếu có)
+# -s: im lặng
+# -o /dev/null: bỏ qua output thành công
+# -w '%{http_code}': chỉ in mã trạng thái HTTP
+# --connect-timeout: thời gian chờ tối đa để thiết lập kết nối
+# --max-time: thời gian chờ tối đa cho toàn bộ hoạt động
+http_code=\$(curl -L -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 "\$URL")
+curl_status=\$? # Lấy mã thoát của lệnh curl
 
-if [ \$curl_status -eq 0 ]; then
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - Successfully pinged \$URL" >> "\$LOG_FILE"
+if [ \$curl_status -eq 0 ] && [[ "\$http_code" == 2* || "\$http_code" == 3* ]]; then
+    # Mã thoát 0 và HTTP code 2xx hoặc 3xx được coi là thành công
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - Successfully pinged \$URL - HTTP Status: \$http_code" >> "\$LOG_FILE"
 else
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - Failed to ping \$URL - Status: \$curl_status - Output: \$curl_output" >> "\$LOG_FILE"
+    # Ghi log lỗi chi tiết hơn
+    error_msg="\$(curl -L -s --connect-timeout 15 --max-time 30 "\$URL" 2>&1)" # Chạy lại để lấy output lỗi
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - Failed to ping \$URL - Curl Exit Status: \$curl_status - HTTP Status: \$http_code - Error: \$error_msg" >> "\$LOG_FILE"
 fi
 
 # Giữ log file không quá lớn (giữ 1000 dòng cuối cùng)
@@ -252,16 +276,18 @@ EOL
             echo "chmod +x $MONITOR_SCRIPT_PATH"
         else
             echo "Đang thêm script vào crontab để chạy mỗi 5 phút..."
-            # Xóa job cũ nếu có và thêm job mới
+            # Xóa job cũ nếu có và thêm job mới để chạy mỗi 5 phút
             (crontab -l 2>/dev/null | grep -v "$MONITOR_SCRIPT_PATH" ; echo "*/5 * * * * $MONITOR_SCRIPT_PATH") | crontab -
             if [ $? -ne 0 ]; then
                 echo "Lỗi: Không thể cập nhật crontab. Vui lòng chạy lệnh sau thủ công:"
-                echo "'crontab -e' và thêm dòng: */5 * * * * $MONITOR_SCRIPT_PATH"
+                echo "1. Chạy 'crontab -e'"
+                echo "2. Xóa dòng cũ liên quan đến $MONITOR_SCRIPT_PATH (nếu có)"
+                echo "3. Thêm dòng mới: */5 * * * * $MONITOR_SCRIPT_PATH"
             else
-                 echo "Đã thêm vào crontab."
-                 # Không cần chạy caffeine nếu chỉ dùng cron
-                 # echo "Đang chạy caffeine trong nền..."
-                 # sudo nohup caffeine > /dev/null 2>&1 &
+                 echo "Đã thêm vào crontab để chạy mỗi 5 phút."
+                 # Nếu bạn thực sự cần ngăn máy tính ngủ, hãy bỏ comment dòng dưới
+                 # echo "Đang chạy caffeine trong nền (nếu đã cài đặt)..."
+                 # sudo nohup caffeine > /dev/null 2>&1 & disown
             fi
         fi
     fi
@@ -269,4 +295,4 @@ else
     echo "Bỏ qua thiết lập script giữ session."
 fi
 
-echo "==== HOÀN TẤT ===="
+echo "==== HOÀN TẤT TOÀN BỘ SCRIPT ===="
