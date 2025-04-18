@@ -212,7 +212,7 @@ echo "  4. Log của container 'n8n' xem có lỗi khởi động không (lệnh
 echo ""
 echo "Tài khoản đăng nhập N8N:"
 echo "  Username: admin"
-echo "  Password: changeme123 (!!! HÃY ĐỔI MẬT KHẨU NGAY TRONG CÀI ĐẶT N8N !!!)"
+echo "  Password: DoanhProS01 (!!! HÃY ĐỔI MẬT KHẨU NGAY TRONG CÀI ĐẶT N8N !!!)"
 echo "--------------------------------------------------"
 
 # --- Phần giữ session (Tùy chọn) ---
@@ -275,20 +275,22 @@ EOL
             echo "Lỗi: Không thể cấp quyền thực thi. Vui lòng chạy lệnh sau thủ công:"
             echo "chmod +x $MONITOR_SCRIPT_PATH"
         else
-            echo "Đang thêm script vào crontab để chạy mỗi 5 phút..."
-            # Xóa job cũ nếu có và thêm job mới để chạy mỗi 5 phút
-            (crontab -l 2>/dev/null | grep -v "$MONITOR_SCRIPT_PATH" ; echo "*/5 * * * * $MONITOR_SCRIPT_PATH") | crontab -
+            # ---- START SỬA ĐỔI ----
+            echo "Đang thêm script vào crontab để chạy mỗi 1 phút..." # <- Thay đổi text
+            # Xóa job cũ nếu có và thêm job mới để chạy mỗi 1 phút
+            (crontab -l 2>/dev/null | grep -v "$MONITOR_SCRIPT_PATH" ; echo "* * * * * $MONITOR_SCRIPT_PATH") | crontab - # <- Thay đổi */5 thành *
             if [ $? -ne 0 ]; then
                 echo "Lỗi: Không thể cập nhật crontab. Vui lòng chạy lệnh sau thủ công:"
                 echo "1. Chạy 'crontab -e'"
                 echo "2. Xóa dòng cũ liên quan đến $MONITOR_SCRIPT_PATH (nếu có)"
-                echo "3. Thêm dòng mới: */5 * * * * $MONITOR_SCRIPT_PATH"
+                echo "3. Thêm dòng mới: * * * * * $MONITOR_SCRIPT_PATH" # <- Thay đổi */5 thành *
             else
-                 echo "Đã thêm vào crontab để chạy mỗi 5 phút."
+                 echo "Đã thêm vào crontab để chạy mỗi 1 phút." # <- Thay đổi text
                  # Nếu bạn thực sự cần ngăn máy tính ngủ, hãy bỏ comment dòng dưới
-                 echo "Đang chạy caffeine trong nền (nếu đã cài đặt)..."
-                 sudo nohup caffeine > /dev/null 2>&1 & disown
+                 # echo "Đang chạy caffeine trong nền (nếu đã cài đặt)..."
+                 # sudo nohup caffeine > /dev/null 2>&1 & disown
             fi
+            # ---- END SỬA ĐỔI ----
         fi
     fi
 else
