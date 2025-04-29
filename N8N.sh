@@ -1,187 +1,207 @@
 #!/bin/bash
 
-# === CONFIGURATION ===
-# Thư mục cài đặt n8n và lưu dữ liệu
-N8N_DIR="/opt/n8n"
-N8N_DATA_DIR="${N8N_DIR}/data"
+# === Configuration ===
+# N8N Data Directory (relative to the user running the script, e.g., /root/n8n-data if run as root)
+N8N_BASE_DIR="$HOME/n8n-data" # You can change this path if desired
+N8N_VOLUME_DIR="$N8N_BASE_DIR/n8n_local_data"
+DOCKER_COMPOSE_FILE="$N8N_BASE_DIR/docker-compose.yml"
+# Cloudflared config file path
+CLOUDFLARED_CONFIG_FILE="/etc/cloudflared/config.yml"
+# Default Timezone if system TZ is not set
+DEFAULT_TZ="Asia/Ho_Chi_Minh"
 
-# Timezone cho n8n (Ví dụ: Asia/Ho_Chi_Minh)
-N8N_TIMEZONE="Asia/Ho_Chi_Minh"
-
-# Token Cloudflare Tunnel
-# LƯU Ý: Đây là thông tin nhạy cảm!
-CF_TOKEN="eyJhIjoiZWNhMjg3MTJiZjY0N2I2ZmYyNDBkZjU4MjZlNWNkOTYiLCJ0IjoiMTczYTU3YjctMjBlOS00ZDI0LThiN2QtN2JjMGY0YzE1NTgzIiwicyI6Ik1qazROekkzWmpjdE5UWXlNaTAwTldWaExUaGhaV010WXpaaVpEQXhNakF4TnpkaSJ9"
-
-# === SCRIPT START ===
-
-# Dừng script nếu có lỗi
+# === Script Execution ===
+# Exit immediately if a command exits with a non-zero status.
 set -e
+# Treat unset variables as an error when substituting.
+set -u
+# Prevent errors in a pipeline from being masked.
+set -o pipefail
 
-# Kiểm tra quyền root
+# --- Check if running as root ---
 if [ "$(id -u)" -ne 0 ]; then
-  echo ">>> Script này cần được chạy với quyền root (sudo)."
-  exit 1
+   echo "This script must be run as root. Please use 'sudo ./install_n8n_docker_cloudflared.sh'" >&2
+   exit 1
 fi
 
-echo ">>> Bắt đầu quá trình cài đặt n8n và Cloudflare Tunnel..."
+# --- Get User Input ---
+echo "--------------------------------------------------"
+echo " Cloudflare Tunnel and n8n Setup Script "
+echo "--------------------------------------------------"
+echo "This script will install Docker, Cloudflared, and configure n8n"
+echo "to be accessible via your Cloudflare Tunnel."
+echo ""
 
-# 1. Cập nhật hệ thống và cài đặt các gói cần thiết
-echo ">>> 1/5: Cập nhật hệ thống và cài đặt các gói cần thiết..."
+read -p "Enter your Cloudflare Tunnel Token: " CF_TOKEN
+if [ -z "$CF_TOKEN" ]; then
+    echo "Error: Cloudflare Tunnel Token cannot be empty." >&2
+    exit 1
+fi
+
+read -p "Enter the Public Hostname (e.g., n8n.yourdomain.com): " CF_HOSTNAME
+if [ -z "$CF_HOSTNAME" ]; then
+    echo "Error: Public Hostname cannot be empty." >&2
+    exit 1
+fi
+echo "" # Newline for better formatting
+
+# --- System Update and Prerequisites ---
+echo ">>> Updating system packages..."
 apt update
-apt upgrade -y
-apt install -y curl wget gnupg lsb-release ca-certificates apt-transport-https
+echo ">>> Installing prerequisites (curl, wget, gpg, etc.)..."
+apt install -y apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release wget
 
-# 2. Cài đặt Docker và Docker Compose
-echo ">>> 2/5: Cài đặt Docker và Docker Compose..."
+# --- Install Docker ---
 if ! command -v docker &> /dev/null; then
-    echo ">>> Docker chưa được cài đặt. Tiến hành cài đặt..."
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    rm get-docker.sh
-    # Thêm người dùng hiện tại (nếu đang chạy sudo từ user thường) vào group docker
-    # Nếu bạn chạy script trực tiếp bằng root thì không cần thiết lắm
-    if [ -n "$SUDO_USER" ]; then
-        usermod -aG docker "$SUDO_USER"
-        echo ">>> Đã thêm người dùng '$SUDO_USER' vào nhóm 'docker'. Bạn cần đăng xuất và đăng nhập lại để thay đổi có hiệu lực khi chạy lệnh docker không cần sudo."
+    echo ">>> Docker not found. Installing Docker..."
+    # Add Docker's official GPG key:
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    # Add the repository to Apt sources:
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt update
+
+    # Install Docker packages
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    echo ">>> Docker installed successfully."
+
+    # Add the current sudo user (if exists) to the docker group
+    # This avoids needing sudo for every docker command AFTER logging out/in again
+    REAL_USER="${SUDO_USER:-$(whoami)}"
+    if id "$REAL_USER" &>/dev/null && ! getent group docker | grep -qw "$REAL_USER"; then
+      echo ">>> Adding user '$REAL_USER' to the 'docker' group..."
+      usermod -aG docker "$REAL_USER"
+      echo ">>> NOTE: User '$REAL_USER' needs to log out and log back in for docker group changes to take full effect."
     fi
-    echo ">>> Docker đã được cài đặt."
+
 else
-    echo ">>> Docker đã được cài đặt."
+    echo ">>> Docker is already installed."
 fi
 
-# Kiểm tra Docker Compose (thường được cài cùng Docker qua script trên)
-if ! docker compose version &> /dev/null; then
-    echo ">>> Docker Compose (v2 plugin) không tìm thấy. Thử cài đặt lại..."
-    apt install docker-compose-plugin -y
-    if ! docker compose version &> /dev/null; then
-       echo ">>> LỖI: Không thể cài đặt Docker Compose plugin. Vui lòng kiểm tra thủ công."
-       exit 1
-    fi
+# Ensure Docker service is running and enabled
+echo ">>> Ensuring Docker service is running and enabled..."
+systemctl start docker
+systemctl enable docker
+echo ">>> Docker service check complete."
+
+# --- Install Cloudflared ---
+if ! command -v cloudflared &> /dev/null; then
+    echo ">>> Cloudflared not found. Installing Cloudflared..."
+    # Download the ARM64 package
+    CLOUDFLARED_DEB_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb"
+    CLOUDFLARED_DEB_PATH="/tmp/cloudflared-linux-arm64.deb"
+    echo ">>> Downloading Cloudflared package from $CLOUDFLARED_DEB_URL..."
+    wget -q "$CLOUDFLARED_DEB_URL" -O "$CLOUDFLARED_DEB_PATH"
+    echo ">>> Installing Cloudflared package..."
+    dpkg -i "$CLOUDFLARED_DEB_PATH"
+    rm "$CLOUDFLARED_DEB_PATH" # Clean up downloaded file
+    echo ">>> Cloudflared installed successfully."
+else
+    echo ">>> Cloudflared is already installed."
 fi
-echo ">>> Docker Compose đã sẵn sàng."
 
+# --- Setup n8n Directory and Permissions ---
+echo ">>> Setting up n8n data directory: $N8N_BASE_DIR"
+mkdir -p "$N8N_VOLUME_DIR" # Create the specific volume dir as well
+# Set ownership to UID 1000, GID 1000 (standard 'node' user in n8n container)
+# This prevents permission errors when n8n tries to write data
+echo ">>> Setting permissions for n8n data volume..."
+chown -R 1000:1000 "$N8N_VOLUME_DIR"
 
-# 3. Thiết lập và chạy n8n với Docker Compose
-echo ">>> 3/5: Thiết lập và chạy n8n..."
-
-echo ">>> Tạo thư mục cho n8n: ${N8N_DIR}"
-mkdir -p "${N8N_DATA_DIR}"
-# Không cần chmod/chown nếu chạy bằng docker mặc định, trừ khi có lỗi permission
-
-echo ">>> Tạo file docker-compose.yml cho n8n tại ${N8N_DIR}/docker-compose.yml"
-cat << EOF > "${N8N_DIR}/docker-compose.yml"
-version: '3.7'
-
+# --- Create Docker Compose File ---
+echo ">>> Creating Docker Compose file: $DOCKER_COMPOSE_FILE"
+# Determine Timezone
+SYSTEM_TZ=$(cat /etc/timezone 2>/dev/null || echo "$DEFAULT_TZ")
+cat <<EOF > "$DOCKER_COMPOSE_FILE"
 services:
   n8n:
     image: n8nio/n8n
-    container_name: n8n
-    restart: always
+    container_name: n8n_service
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:5678:5678" # Chỉ expose cho localhost, cloudflared sẽ kết nối vào đây
+      # Bind only to localhost, as Cloudflared will handle external access
+      - "127.0.0.1:5678:5678"
     environment:
-      - N8N_HOST=\${N8N_HOST} # Sẽ dùng trong tương lai nếu cần custom domain trực tiếp
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=http # Cloudflare sẽ xử lý HTTPS
-      - NODE_ENV=production
-      - WEBHOOK_URL=\${WEBHOOK_URL} # Sẽ được Cloudflare Tunnel xử lý
-      - GENERIC_TIMEZONE=${N8N_TIMEZONE}
+      # Use system timezone if available, otherwise default
+      - TZ=${SYSTEM_TZ}
+      # N8N_SECURE_COOKIE=false # DO NOT USE THIS when accessing via HTTPS (Cloudflared)
+      # Add any other specific n8n environment variables here:
+      # - N8N_HOST=$CF_HOSTNAME # Optional: Tell n8n its public hostname
+      # - WEBHOOK_URL=https://$CF_HOSTNAME/ # Optional: Base URL for webhooks
     volumes:
-      - ./data:/home/node/.n8n # Sử dụng đường dẫn tương đối tới thư mục data
-    # Thêm user nếu bạn muốn chạy container với user không phải root (an toàn hơn)
-    # user: "1000:1000" # Đảm bảo thư mục data có quyền ghi cho UID/GID này
+      # Mount the local data directory into the container
+      - ./n8n_local_data:/home/node/.n8n
 
 networks:
   default:
-    name: n8n_network
+    name: n8n-network # Define a specific network name (optional but good practice)
+
 EOF
+echo ">>> Docker Compose file created."
 
-echo ">>> Khởi chạy n8n container..."
-cd "${N8N_DIR}"
-# Sử dụng docker compose thay vì docker-compose (chuẩn mới)
-docker compose up -d
+# --- Configure Cloudflared Service ---
+echo ">>> Configuring Cloudflared..."
+# Create directory if it doesn't exist
+mkdir -p /etc/cloudflared
 
-echo ">>> Đợi n8n khởi động (khoảng 30 giây)..."
-sleep 30
+# Create cloudflared config.yml
+echo ">>> Creating Cloudflared config file: $CLOUDFLARED_CONFIG_FILE"
+cat <<EOF > "$CLOUDFLARED_CONFIG_FILE"
+# This file is configured for tunnel runs via 'cloudflared service install'
+# It defines the ingress rules. Tunnel ID and credentials file are managed
+# automatically by the service install command using the provided token.
+# Do not add 'tunnel:' or 'credentials-file:' lines here.
 
-# Kiểm tra nhanh xem n8n có chạy không
-if curl --fail http://127.0.0.1:5678 > /dev/null 2>&1; then
-    echo ">>> n8n đang chạy tại http://127.0.0.1:5678"
-else
-    echo ">>> CẢNH BÁO: Không thể kết nối tới n8n tại http://127.0.0.1:5678. Kiểm tra logs bằng 'docker logs n8n'"
-    # Không dừng script ở đây, có thể n8n cần thêm thời gian
-fi
+ingress:
+  - hostname: ${CF_HOSTNAME}
+    service: http://localhost:5678 # Points to n8n running locally via Docker port mapping
+  - service: http_status:404 # Catch-all rule
+EOF
+echo ">>> Cloudflared config file created."
 
+# Install cloudflared as a service using the token
+echo ">>> Installing Cloudflared service using the provided token..."
+# The service install command handles storing the token securely
+cloudflared service install "$CF_TOKEN"
+echo ">>> Cloudflared service installed."
 
-# 4. Cài đặt Cloudflared
-echo ">>> 4/5: Cài đặt Cloudflared..."
+# --- Start Services ---
+echo ">>> Enabling and starting Cloudflared service..."
+systemctl enable cloudflared
+systemctl start cloudflared
 
-# Xác định kiến trúc (thường là arm64 cho Orange Pi 3B)
-ARCH=$(dpkg --print-architecture)
-if [ "$ARCH" != "arm64" ]; then
-   echo ">>> CẢNH BÁO: Kiến trúc là $ARCH. Script này được tối ưu cho arm64. Có thể cần điều chỉnh link download cloudflared."
-   # Bạn có thể thêm điều kiện khác ở đây nếu cần hỗ trợ armhf chẳng hạn
-fi
+# Brief pause to allow service to stabilize
+sleep 5
+echo ">>> Checking Cloudflared service status:"
+systemctl status cloudflared --no-pager || echo "Warning: Cloudflared status check indicates an issue. Use 'sudo journalctl -u cloudflared' for details."
 
-CF_DOWNLOAD_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb"
-CF_DEB_FILE="/tmp/cloudflared-linux-${ARCH}.deb"
+echo ">>> Starting n8n container via Docker Compose..."
+# Use -f to specify the file, ensuring it runs from anywhere
+# Use --remove-orphans to clean up any old containers if the compose file changed significantly
+# Use -d to run in detached mode
+docker compose -f "$DOCKER_COMPOSE_FILE" up --remove-orphans -d
 
-echo ">>> Tải Cloudflared (${ARCH}) từ ${CF_DOWNLOAD_URL}..."
-wget -O "${CF_DEB_FILE}" "${CF_DOWNLOAD_URL}"
-
-echo ">>> Cài đặt Cloudflared từ file .deb..."
-dpkg -i "${CF_DEB_FILE}" || apt --fix-broken install -y # Cài đặt và sửa lỗi dependency nếu có
-dpkg -i "${CF_DEB_FILE}" # Thử cài lại sau khi sửa lỗi dependency
-
-echo ">>> Dọn dẹp file cài đặt..."
-rm "${CF_DEB_FILE}"
-
-echo ">>> Cloudflared đã được cài đặt."
-
-
-# 5. Đăng ký và khởi chạy Cloudflared service
-echo ">>> 5/5: Đăng ký và khởi chạy Cloudflared service..."
-
-echo ">>> Sử dụng token để đăng ký service cloudflared..."
-# Lệnh này sẽ tạo file config và cert trong /etc/cloudflared/ (hoặc ~/.cloudflared nếu chạy không root)
-# và tạo systemd service unit.
-cloudflared service install "${CF_TOKEN}"
-
-echo ">>> Kích hoạt và khởi động service cloudflared..."
-systemctl enable --now cloudflared
-
-echo ">>> Đợi cloudflared kết nối (khoảng 10 giây)..."
-sleep 10
-
-echo ">>> Kiểm tra trạng thái service cloudflared:"
-systemctl status cloudflared --no-pager
-
-# === HOÀN TẤT ===
+# --- Final Instructions ---
 echo ""
-echo "=================================================="
-echo ">>> QUÁ TRÌNH CÀI ĐẶT HOÀN TẤT <<<"
-echo "=================================================="
+echo "--------------------------------------------------"
+echo " Setup Complete! "
+echo "--------------------------------------------------"
+echo "n8n should now be running in Docker and accessible via Cloudflare Tunnel."
 echo ""
-echo "* n8n đang chạy dưới dạng Docker container."
-echo "  - Kiểm tra logs: docker logs n8n"
-echo "  - Dừng n8n: cd ${N8N_DIR} && docker compose down"
-echo "  - Khởi động lại n8n: cd ${N8N_DIR} && docker compose up -d"
-echo "  - Truy cập nội bộ: http://<IP_ORANGE_PI>:5678 (nếu bạn thay đổi port mapping)"
+echo "Access your n8n instance at:"
+echo "  https://${CF_HOSTNAME}"
 echo ""
-echo "* Cloudflared đang chạy như một service."
-echo "  - Kiểm tra logs: journalctl -u cloudflared -f"
-echo "  - Trạng thái service: systemctl status cloudflared"
-echo "  - Khởi động lại service: systemctl restart cloudflared"
-echo ""
-echo "* QUAN TRỌNG: Đảm bảo bạn đã cấu hình Tunnel trong Cloudflare Zero Trust Dashboard:"
-echo "  - Tunnel Name: n8n-Doanh (hoặc tương ứng với ID 173a57b7-20e9-4d24-8b7d-7bc0f4c15583)"
-echo "  - Public Hostname: n8n.doanh.id.vn"
-echo "  - Service: **http://localhost:5678** (Để truy cập n8n qua web)"
-echo "    (Nếu bạn thực sự muốn SSH, hãy đổi thành ssh://localhost:22 và đảm bảo SSH server đang chạy)"
-echo ""
-echo ">>> Sau khi cấu hình đúng trên Cloudflare, bạn sẽ có thể truy cập n8n qua https://n8n.doanh.id.vn"
-echo ""
-if [ -n "$SUDO_USER" ]; then
-    echo ">>> NHẮC NHỞ: Đăng xuất và đăng nhập lại để có thể chạy lệnh 'docker' mà không cần 'sudo'."
-fi
-echo "=================================================="
+echo "Notes:"
+echo "- It might take a minute or two for the Cloudflare Tunnel connection to be fully established."
+echo "- If you encounter issues, check the n8n container logs: 'docker logs n8n_service'"
+echo "- Check Cloudflared service logs: 'sudo journalctl -u cloudflared -f'"
+echo "- Ensure DNS for ${CF_HOSTNAME} is correctly pointing to your Cloudflare Tunnel (usually handled automatically by Cloudflare)."
+echo "- Remember to log out and log back in if user '$REAL_USER' was just added to the 'docker' group."
+echo "--------------------------------------------------"
+
+exit 0
